@@ -14,6 +14,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
+from app.services.merge_snapshot import merge_snapshot_service
 from app.store import store
 
 
@@ -124,7 +125,11 @@ class PipelineEngine:
         }
 
     def run_cdc_upsert_simulation(self, cdc_id: int) -> dict[str, Any]:
-        """模拟CDC捕获后的增量合并：产生合并结果记录。"""
+        """模拟CDC捕获后的增量合并：写入终态合并数据快照并发布下游。
+
+        合并产物统一落在 ``merge_snapshot_records``，同时保留原来的
+        ``upsert_merge_artifacts`` 供既有调用方回查。
+        """
         cdc = store.find("change_capture", cdc_id)
         if not cdc:
             return {"ok": False, "error": f"CDC配置 {cdc_id} 不存在"}
@@ -135,6 +140,9 @@ class PipelineEngine:
             return {"ok": False, "error": f"源表 {source_table} 未配置合并策略"}
 
         merge_key = upsert.get("合并键列", "id")
+        change_seq = cdc.get("变更序号")
+        source_version = cdc.get("源表版本") or upsert.get("源表版本")
+
         # 模拟产生合并产物
         merged_records = []
         for i in range(3):
@@ -151,6 +159,25 @@ class PipelineEngine:
         for rec in merged_records:
             store.rows("upsert_merge_artifacts").append(rec)
 
+        snapshot_records = []
+        for i, rec in enumerate(merged_records):
+            snapshot_records.append({
+                merge_key: rec["merge_key"],
+                "状态": "DELETE" if rec["operation"] == "DELETE" else "已支付",
+                "is_deleted": rec["operation"] == "DELETE",
+                "变更序号": int(change_seq or 0) + i,
+                "源表版本": source_version,
+                "updated_at": rec["merged_at"],
+            })
+        merge_snapshot_service.submit_batch(
+            upsert,
+            records=snapshot_records,
+            source="change_capture",
+            source_version=source_version,
+            batch_id=f"CDC-{cdc.get('配置编号')}-SIM-{change_seq or 0}",
+            cdc_id=cdc_id,
+        )
+
         return {
             "ok": True,
             "cdc_id": cdc_id,
@@ -158,6 +185,7 @@ class PipelineEngine:
             "merge_key": merge_key,
             "merged_count": len(merged_records),
             "artifacts": merged_records,
+            "snapshot": merge_snapshot_service.get_snapshot(upsert),
         }
 
     def apply_partition_to_iceberg(self, table_name: str) -> dict[str, Any]:
@@ -586,6 +614,8 @@ class PipelineEngine:
             "compact_results": len(store.rows("compact_results")),
             "ttl_applied_log": len(store.rows("ttl_applied_log")),
             "realtime_metric_results": len(store.rows("realtime_metric_results")),
+            "merge_snapshot_records": len(store.rows("merge_snapshot_records")),
+            "merge_downstream_records": len(store.rows("merge_downstream_records")),
         }
 
         return {

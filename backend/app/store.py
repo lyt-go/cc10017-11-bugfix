@@ -21,6 +21,11 @@ class Store:
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
 
+    def replace(self, module: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """整体替换一张表：发布快照时保证读不到半新半旧的数据。"""
+        self._tables[module] = [dict(row) for row in rows]
+        return self._tables[module]
+
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):
             if int(row.get("id", 0)) == entry_id:
@@ -43,6 +48,7 @@ class Store:
             "quality_inspection_results", "materialized_refresh_log",
             "sink_dispatch_queue", "compact_results",
             "ttl_applied_log", "realtime_metric_results",
+            "merge_snapshot_records", "merge_downstream_records",
         ]
         artifact_counts = {n: len(self.rows(n)) for n in artifact_names}
         total_artifacts = sum(artifact_counts.values())

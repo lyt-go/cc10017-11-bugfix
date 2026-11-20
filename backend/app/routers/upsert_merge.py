@@ -83,6 +83,71 @@ def create_entry(payload: dict[str, object]) -> ActionResult:
     return ActionResult(ok=True, message="合并策略已登记", entry=entry)
 
 
+@router.get("/{entry_id}/snapshot", response_model=dict)
+def get_merge_snapshot(entry_id: int) -> dict:
+    """读取终态合并数据快照：保留删除标记、最终排序值、来源批次与发布版本。"""
+    snapshot = service.get_merge_snapshot(entry_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"合并策略 {entry_id} 不存在或已归档")
+    return snapshot
+
+
+@router.get("/{entry_id}/downstream", response_model=dict)
+def get_downstream_records(entry_id: int) -> dict:
+    """读取下游可见记录，用于核对与终态快照是否同版本。"""
+    downstream = service.get_downstream_records(entry_id)
+    if downstream is None:
+        raise HTTPException(status_code=404, detail=f"合并策略 {entry_id} 不存在或已归档")
+    return downstream
+
+
+@router.post("/{entry_id}/merge", response_model=ActionResult)
+def run_merge(entry_id: int, payload: dict[str, object] | None = None) -> ActionResult:
+    """提交一批增量变更：按变更序号归并并发布终态快照。"""
+    body = payload or {}
+    records = body.get("records")
+    if not isinstance(records, list):
+        records = []
+    result = service.merge_batch(
+        entry_id,
+        records=records,
+        source_version=body.get("source_version"),
+        batch_id=body.get("batch_id") if isinstance(body.get("batch_id"), str) else None,
+        interrupt=body.get("interrupt") if isinstance(body.get("interrupt"), str) else None,
+    )
+    if not result.get("ok"):
+        return ActionResult(ok=False, message=str(result.get("error", "增量合并失败")))
+    return ActionResult(ok=True, message=str(result.get("message", "增量合并已应用")), entry=result)
+
+
+@router.post("/{entry_id}/merge-demo", response_model=ActionResult)
+def run_merge_demo(entry_id: int) -> ActionResult:
+    """运行两批演示变更：较新的删除先到、次新的更新迟到。"""
+    result = service.run_demo_merge(entry_id)
+    if not result.get("ok"):
+        return ActionResult(ok=False, message=str(result.get("error", "增量合并失败")))
+    return ActionResult(ok=True, message=str(result.get("message")), entry=result)
+
+
+@router.post("/{entry_id}/snapshot/retry", response_model=ActionResult)
+def retry_merge_snapshot(entry_id: int) -> ActionResult:
+    """发布中断后重试：从已落盘的终态快照补齐下游并追加后续批次。"""
+    result = service.retry_merge_snapshot(entry_id)
+    if not result.get("ok"):
+        return ActionResult(ok=False, message=str(result.get("error", "重试失败")))
+    return ActionResult(ok=True, message=str(result.get("message", "已补齐")), entry=result)
+
+
+@router.post("/{entry_id}/snapshot/interrupt", response_model=ActionResult)
+def interrupt_merge_snapshot(entry_id: int, payload: dict[str, object] | None = None) -> ActionResult:
+    """模拟一次发布中断，供补齐路径验证；仅在演示环境使用。"""
+    stage = (payload or {}).get("stage")
+    result = service.interrupt_merge_snapshot(entry_id, str(stage) if stage else None)
+    if "error" in result:
+        return ActionResult(ok=False, message=str(result.get("error")))
+    return ActionResult(ok=True, message=str(result.get("message", "发布已中断")), entry=result)
+
+
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
     """对单条合并策略执行提交校验、标记生效、停用策略；不允许的动作会被拦下并说明原因。"""
